@@ -140,7 +140,7 @@ function App() {
     }
 
     if (!('speechSynthesis' in window)) {
-      console.warn('Text-to-speech not supported in this browser')
+      alert('Text-to-speech not supported in this browser')
       return
     }
 
@@ -272,7 +272,6 @@ function App() {
       const data = await response.json()
       const message = data.choices?.[0]?.message?.content?.trim() ?? ''
       if (!message) {
-        console.warn('Empty response from model:', data)
         setError('The fish is speechless. Try again?')
         return
       }
@@ -280,7 +279,6 @@ function App() {
       // Auto-play the translation with text-to-speech
       playTranslation(message)
     } catch (err) {
-      console.error('Translation error:', err)
       const errorMessage = err instanceof Error ? err.message : 'Unknown error'
       setError(`The fish swallowed a bubble: ${errorMessage}`)
     } finally {
@@ -390,8 +388,12 @@ function App() {
           <div className="translator__actions">
             <button
               className="translate-button"
-              onClick={handleTranslate}
-              disabled={isTranslating || !hfToken}
+              type="button"
+              onClick={(e) => {
+                e.preventDefault()
+                handleTranslate()
+              }}
+              disabled={isTranslating}
             >
               {isTranslating ? 'Translating…' : 'Translate'}
             </button>
