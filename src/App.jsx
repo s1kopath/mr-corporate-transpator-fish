@@ -27,7 +27,10 @@ const getSpeechRecognition = () => {
   )
 }
 
-const MODEL_ID = 'Phi-3.5-mini-instruct-q4f16_1-MLC'
+// Using a fast, available model from Hugging Face Inference Providers
+// You can change this to any model available on HF Inference Providers
+const MODEL_ID = 'meta-llama/Llama-3.2-3B-Instruct:fastest'
+const HF_API_BASE = 'https://router.huggingface.co/v1'
 
 function App() {
   const [mode, setMode] = useState(MODE_CONFIG.corporateToPlain.id)
@@ -35,15 +38,35 @@ function App() {
   const [output, setOutput] = useState('')
   const [isListening, setIsListening] = useState(false)
   const [error, setError] = useState('')
-  const [engineStatus, setEngineStatus] = useState({ state: 'idle', message: 'Warming up the fish brain...' })
   const [isTranslating, setIsTranslating] = useState(false)
-  const [engineReloadToken, setEngineReloadToken] = useState(0)
-  const [loadHint, setLoadHint] = useState('')
+  const [isSpeaking, setIsSpeaking] = useState(false)
+  const speechSynthesisRef = useRef(null)
+  const [hfToken, setHfToken] = useState(() => {
+    // First try environment variable (for production/build)
+    // Vite exposes env vars prefixed with VITE_ to the client
+    const envToken = import.meta.env.VITE_HF_TOKEN
+    if (envToken) return envToken
+
+    // Fallback to localStorage (for development/testing)
+    return localStorage.getItem('hf_token') || ''
+  })
+  const [showTokenInput, setShowTokenInput] = useState(() => {
+    // Don't show token input if env var is set
+    return !import.meta.env.VITE_HF_TOKEN && !localStorage.getItem('hf_token')
+  })
 
   const recognitionRef = useRef(null)
-  const engineRef = useRef(null)
-  const lastProgressRef = useRef({ value: 0, timestamp: Date.now() })
+  const speechInputRef = useRef(false) // Track if input came from speech recognition
   const speechSupported = useMemo(() => Boolean(getSpeechRecognition()), [])
+
+  // Cleanup speech synthesis on unmount
+  useEffect(() => {
+    return () => {
+      if (speechSynthesisRef.current) {
+        window.speechSynthesis.cancel()
+      }
+    }
+  }, [])
 
   useEffect(() => {
     const RecognitionCtor = getSpeechRecognition()
@@ -57,18 +80,33 @@ function App() {
     recognition.onresult = (event) => {
       const transcript = event.results?.[0]?.[0]?.transcript ?? ''
       if (transcript) {
+        speechInputRef.current = true // Mark that this input came from speech
         setInput(transcript)
         setOutput('')
+        // Store transcript for auto-translate
+        recognitionRef.current.lastTranscript = transcript
       }
     }
 
     recognition.onerror = () => {
       setIsListening(false)
+      speechInputRef.current = false
+      recognitionRef.current.lastTranscript = null
       setError('Microphone hiccup — try again?')
     }
 
     recognition.onend = () => {
       setIsListening(false)
+      // Auto-translate if input came from speech recognition
+      const transcript = recognitionRef.current?.lastTranscript
+      if (speechInputRef.current && transcript && transcript.trim()) {
+        // Pass transcript directly to avoid state timing issues
+        setTimeout(() => {
+          handleTranslate(transcript)
+        }, 100)
+      }
+      speechInputRef.current = false
+      recognitionRef.current.lastTranscript = null
     }
 
     recognitionRef.current = recognition
@@ -78,115 +116,67 @@ function App() {
     }
   }, [])
 
+  // Save token to localStorage when it changes (only if not using env var)
   useEffect(() => {
-    if (typeof navigator !== 'undefined' && !navigator.gpu) {
-      setEngineStatus({
-        state: 'error',
-        message: 'WebGPU not supported in this browser. Try Chrome 113+ or Edge 113+ on desktop.',
-      })
+    const envToken = import.meta.env.VITE_HF_TOKEN
+    // Only save to localStorage if not using env variable
+    if (!envToken) {
+      if (hfToken) {
+        localStorage.setItem('hf_token', hfToken)
+        setShowTokenInput(false)
+      } else {
+        localStorage.removeItem('hf_token')
+      }
+    } else {
+      // If env var is set, hide token input
+      setShowTokenInput(false)
+    }
+  }, [hfToken])
+
+  const playTranslation = (text) => {
+    // Stop any ongoing speech
+    if (speechSynthesisRef.current) {
+      window.speechSynthesis.cancel()
+    }
+
+    if (!('speechSynthesis' in window)) {
+      console.warn('Text-to-speech not supported in this browser')
       return
     }
 
-    let isCancelled = false
+    setIsSpeaking(true)
+    const utterance = new SpeechSynthesisUtterance(text)
+    utterance.rate = 0.95 // Slightly slower for more natural speech
+    utterance.pitch = 1.0
+    utterance.volume = 0.9
 
-    const loadEngine = async () => {
-      setEngineStatus({ state: 'loading', message: 'Scooping an open-source brain for the fish...' })
-      try {
-        const { CreateMLCEngine, prebuiltAppConfig } = await import('@mlc-ai/web-llm')
-        const modelRecord = prebuiltAppConfig.model_list.find((candidate) => candidate.model_id === MODEL_ID)
-
-        if (!modelRecord) {
-          throw new Error(`Model ${MODEL_ID} is not available in the prebuilt model list.`)
-        }
-
-        const engine = await CreateMLCEngine(MODEL_ID, {
-          initProgressCallback: (progress) => {
-            if (!isCancelled) {
-              const numericProgress =
-                typeof progress.progress === 'number' && Number.isFinite(progress.progress) ? progress.progress : null
-              if (numericProgress !== null) {
-                lastProgressRef.current = { value: numericProgress, timestamp: Date.now() }
-                if (numericProgress > 0.99) {
-                  setLoadHint('Almost there… prepping the fish to talk.')
-                } else {
-                  setLoadHint('')
-                }
-              }
-              const percentage = numericProgress !== null ? Math.round(numericProgress * 100) : null
-              setEngineStatus({
-                state: 'loading',
-                message: percentage
-                  ? `Loading fish brain… ${percentage}%`
-                  : progress.text ?? 'Loading model...',
-              })
-            }
-          },
-          appConfig: {
-            ...prebuiltAppConfig,
-            model_list: prebuiltAppConfig.model_list.filter((candidate) => candidate.model_id === MODEL_ID),
-          },
-        })
-
-        if (isCancelled) return
-
-        engineRef.current = engine
-        setEngineStatus({ state: 'ready', message: 'Fish is ready to translate!' })
-        setLoadHint('')
-      } catch (err) {
-        if (!isCancelled) {
-          setEngineStatus({
-            state: 'error',
-            message:
-              err instanceof Error
-                ? `Could not load the open-source model: ${err.message}`
-                : 'Could not load the open-source model.',
-          })
-          setLoadHint('')
-        }
-      }
+    utterance.onend = () => {
+      setIsSpeaking(false)
+      speechSynthesisRef.current = null
     }
 
-    if (!engineRef.current) {
-      loadEngine()
+    utterance.onerror = () => {
+      setIsSpeaking(false)
+      speechSynthesisRef.current = null
     }
 
-    return () => {
-      isCancelled = true
-      const engine = engineRef.current
-      if (engine) {
-        engineRef.current = null
-        if (typeof engine.unload === 'function') {
-          engine.unload().catch(() => { })
-        }
-      }
+    speechSynthesisRef.current = utterance
+    window.speechSynthesis.speak(utterance)
+  }
+
+  const stopSpeaking = () => {
+    if (speechSynthesisRef.current) {
+      window.speechSynthesis.cancel()
+      setIsSpeaking(false)
+      speechSynthesisRef.current = null
     }
-  }, [engineReloadToken])
-
-  useEffect(() => {
-    if (engineStatus.state !== 'loading') {
-      if (engineStatus.state === 'ready') {
-        setLoadHint('')
-      }
-      return
-    }
-
-    const interval = setInterval(() => {
-      const { value, timestamp } = lastProgressRef.current
-      if (engineStatus.state === 'loading' && Date.now() - timestamp > 20000 && value < 1) {
-        setLoadHint((current) =>
-          current ||
-          'Download is taking longer than usual. Check your connection or VPN — the fish needs to reach Hugging Face.',
-        )
-      }
-    }, 5000)
-
-    return () => clearInterval(interval)
-  }, [engineStatus.state])
+  }
 
   const handleToggleMode = (value) => {
     setMode(value)
     setOutput('')
     setError('')
+    stopSpeaking()
   }
 
   const handleMicClick = () => {
@@ -200,12 +190,15 @@ function App() {
     }
 
     try {
+      speechInputRef.current = false // Reset flag
       recognitionRef.current.start()
       setIsListening(true)
       setInput('')
+      setOutput('')
     } catch {
       setError('Unable to access the mic right now.')
       setIsListening(false)
+      speechInputRef.current = false
     }
   }
 
@@ -215,11 +208,11 @@ function App() {
         {
           role: 'system',
           content:
-            'You are a playful but candid corporate jargon translator. You convert formal HR-approved statements into short, punchy plain-speak that keeps the core message intact. Include a wink of humor, but stay respectful and concise (one or two sentences).',
+            'You are a friendly, conversational translator who converts corporate jargon into natural, human-sounding plain English. Write like a real person would speak - use contractions, natural phrasing, and a warm but direct tone. Keep it concise (1-2 sentences) and make it sound like you\'re explaining it to a friend, not a robot. Avoid phrases like "Here\'s the deal:" or overly structured responses.',
         },
         {
           role: 'user',
-          content: `Corporate statement:\n"""${text.trim()}"""\n\nTranslate into straight talk that reveals what the speaker really means.`,
+          content: `Translate this corporate statement into natural, human-sounding plain English:\n"""${text.trim()}"""\n\nWrite it like a real person would say it in conversation.`,
         },
       ]
     }
@@ -228,45 +221,68 @@ function App() {
       {
         role: 'system',
         content:
-          'You are a friendly corporate communications assistant. You take casual or blunt statements and rewrite them into polished, professional corporate language. The result should sound empathetic, respectful, and HR-friendly while keeping the original intent. Aim for one or two sentences.',
+          'You are a warm, professional corporate communications assistant. Transform casual or blunt statements into polished, empathetic corporate language that sounds genuinely human and caring - not robotic or template-like. Use natural phrasing, appropriate warmth, and make it sound like a real person wrote it, not an AI template. Keep it concise (1-2 sentences) and authentic.',
       },
       {
         role: 'user',
-        content: `Casual statement:\n"""${text.trim()}"""\n\nRewrite this as a polished corporate message.`,
+        content: `Rewrite this casual statement as a warm, professional corporate message that sounds genuinely human:\n"""${text.trim()}"""\n\nMake it sound like a real person wrote it, not a template.`,
       },
     ]
   }
 
-  const handleTranslate = async () => {
+  const handleTranslate = async (textToTranslate = null) => {
     setError('')
-    if (!input.trim()) {
+    // Use provided text or fall back to input state
+    const text = textToTranslate || input
+    if (!text || !text.trim()) {
       setError('Tell the fish something first!')
       return
     }
-    if (engineStatus.state !== 'ready' || !engineRef.current) {
-      setError(engineStatus.state === 'error' ? engineStatus.message : 'Fish brain is still loading…')
+    const token = import.meta.env.VITE_HF_TOKEN || hfToken
+    if (!token) {
+      setError('Please enter your Hugging Face token first!')
+      setShowTokenInput(true)
       return
     }
 
     setIsTranslating(true)
     setOutput('')
     try {
-      const response = await engineRef.current.chat.completions.create({
-        messages: buildPrompt(input, mode),
-        max_tokens: 160,
-        temperature: mode === MODE_CONFIG.corporateToPlain.id ? 0.65 : 0.55,
-        top_p: 0.9,
+      const response = await fetch(`${HF_API_BASE}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${import.meta.env.VITE_HF_TOKEN || hfToken}`,
+        },
+        body: JSON.stringify({
+          model: MODEL_ID,
+          messages: buildPrompt(text, mode),
+          max_tokens: 200,
+          temperature: mode === MODE_CONFIG.corporateToPlain.id ? 0.8 : 0.75,
+          top_p: 0.95,
+          stream: false,
+        }),
       })
-      const message = response.choices?.[0]?.message?.content?.trim() ?? ''
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ error: { message: response.statusText } }))
+        throw new Error(errorData.error?.message || `HTTP ${response.status}: ${response.statusText}`)
+      }
+
+      const data = await response.json()
+      const message = data.choices?.[0]?.message?.content?.trim() ?? ''
       if (!message) {
+        console.warn('Empty response from model:', data)
         setError('The fish is speechless. Try again?')
         return
       }
       setOutput(message)
+      // Auto-play the translation with text-to-speech
+      playTranslation(message)
     } catch (err) {
-      setError(
-        err instanceof Error ? `The fish swallowed a bubble: ${err.message}` : 'The fish is having trouble translating.',
-      )
+      console.error('Translation error:', err)
+      const errorMessage = err instanceof Error ? err.message : 'Unknown error'
+      setError(`The fish swallowed a bubble: ${errorMessage}`)
     } finally {
       setIsTranslating(false)
     }
@@ -282,81 +298,78 @@ function App() {
       </header>
 
       <main className="app__content">
-        <section className="mode-toggle" role="radiogroup" aria-label="Translation direction">
-          {Object.values(MODE_CONFIG).map((modeOption) => (
-            <button
-              key={modeOption.id}
-              className={`mode-toggle__button ${mode === modeOption.id ? 'mode-toggle__button--active' : ''}`}
-              onClick={() => handleToggleMode(modeOption.id)}
-              role="radio"
-              aria-checked={mode === modeOption.id}
-            >
-              {modeOption.label}
-            </button>
-          ))}
-        </section>
 
-        <section className="fishbowl">
-          <div className="fishbowl__bubble">
-            {output ? <p>{output}</p> : <p>{activeMode.description}</p>}
-          </div>
-
-          <div className={`fishbowl__bowl ${isListening ? 'fishbowl__bowl--listening' : ''}`}>
-            <div className="fishbowl__water">
-              <div className={`fish ${isListening ? 'fish--listening' : ''}`}>🐟</div>
-              <div className="bubbles">
-                <span />
-                <span />
-                <span />
-              </div>
-            </div>
-          </div>
-
-          <button
-            className={`mic-button ${isListening ? 'mic-button--active' : ''}`}
-            onClick={handleMicClick}
-            disabled={!speechSupported || isTranslating}
-          >
-            {isListening ? 'Listening…' : speechSupported ? 'Talk to the Fish' : 'Mic not supported'}
-          </button>
-
-          <div className="engine-status">
-            {engineStatus.state === 'loading' && <span>{engineStatus.message}</span>}
-            {engineStatus.state === 'ready' && <span className="engine-status__ready">🐟 {engineStatus.message}</span>}
-            {engineStatus.state === 'error' && (
-              <span className="engine-status__error">
-                ⚠️ {engineStatus.message}{' '}
+        {!showTokenInput && (
+          <>
+            <section className="mode-toggle" role="radiogroup" aria-label="Translation direction">
+              {Object.values(MODE_CONFIG).map((modeOption) => (
                 <button
-                  type="button"
-                  className="engine-status__retry"
-                  onClick={() => {
-                    engineRef.current = null
-                    lastProgressRef.current = { value: 0, timestamp: Date.now() }
-                    setEngineStatus({ state: 'loading', message: 'Scooping an open-source brain for the fish...' })
-                    setLoadHint('')
-                    setEngineReloadToken((token) => token + 1)
-                  }}
+                  key={modeOption.id}
+                  className={`mode-toggle__button ${mode === modeOption.id ? 'mode-toggle__button--active' : ''}`}
+                  onClick={() => handleToggleMode(modeOption.id)}
+                  role="radio"
+                  aria-checked={mode === modeOption.id}
                 >
-                  Retry
+                  {modeOption.label}
                 </button>
-              </span>
-            )}
-          </div>
-          {engineStatus.state === 'loading' && loadHint && <div className="engine-hint">{loadHint}</div>}
-          {engineStatus.state === 'error' && (
-            <div className="engine-hint">
-              If it keeps failing, confirm your browser supports WebGPU and that downloads from{' '}
-              <a
-                href="https://huggingface.co/mlc-ai/Phi-3.5-mini-instruct-q4f16_1-MLC"
-                target="_blank"
-                rel="noreferrer"
+              ))}
+            </section>
+
+            <section className="fishbowl">
+              <div className="fishbowl__bubble">
+                {output ? (
+                  <div>
+                    <p>{output}</p>
+                    {output && (
+                      <button
+                        className="speech-button"
+                        onClick={() => isSpeaking ? stopSpeaking() : playTranslation(output)}
+                        title={isSpeaking ? 'Stop speaking' : 'Play translation'}
+                      >
+                        {isSpeaking ? '🔇 Stop' : '🔊 Play'}
+                      </button>
+                    )}
+                  </div>
+                ) : (
+                  <p>{activeMode.description}</p>
+                )}
+              </div>
+              <div className={`fishbowl__bowl ${isListening ? 'fishbowl__bowl--listening' : ''} ${isSpeaking ? 'fishbowl__bowl--speaking' : ''}`}>
+                <div className="fishbowl__water">
+                  <div className={`fish ${isListening ? 'fish--listening' : ''} ${isSpeaking ? 'fish--speaking' : ''}`}>
+                    <div className="fish__body">🐟</div>
+                    {isSpeaking && (
+                      <div className="fish__mouth">
+                        <span className="fish__mouth-open"></span>
+                      </div>
+                    )}
+                  </div>
+                  <div className="bubbles">
+                    <span />
+                    <span />
+                    <span />
+                  </div>
+                  {isSpeaking && (
+                    <div className="speech-bubbles">
+                      <span className="speech-bubble speech-bubble--1" />
+                      <span className="speech-bubble speech-bubble--2" />
+                      <span className="speech-bubble speech-bubble--3" />
+                      <span className="speech-bubble speech-bubble--4" />
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <button
+                className={`mic-button ${isListening ? 'mic-button--active' : ''}`}
+                onClick={handleMicClick}
+                disabled={!speechSupported || isTranslating}
               >
-                Hugging Face
-              </a>{' '}
-              are allowed on your network.
-            </div>
-          )}
-        </section>
+                {isListening ? 'Listening…' : speechSupported ? 'Talk to the Fish' : 'Mic not supported'}
+              </button>
+            </section>
+          </>
+        )}
 
         <section className="translator">
           <label htmlFor="user-input" className="translator__label">
@@ -368,16 +381,19 @@ function App() {
             placeholder="e.g. “We can’t approve vacation right now.”"
             rows={4}
             value={input}
-            onChange={(event) => setInput(event.target.value)}
+            onChange={(event) => {
+              speechInputRef.current = false // Mark as manual input
+              setInput(event.target.value)
+            }}
           />
 
           <div className="translator__actions">
             <button
               className="translate-button"
               onClick={handleTranslate}
-              disabled={isTranslating || engineStatus.state !== 'ready'}
+              disabled={isTranslating || !hfToken}
             >
-              {isTranslating ? 'Translating…' : engineStatus.state !== 'ready' ? 'Please wait…' : 'Translate'}
+              {isTranslating ? 'Translating…' : 'Translate'}
             </button>
             <button
               className="secondary-button"
@@ -399,7 +415,11 @@ function App() {
 
       <footer className="app__footer">
         <small>
-          Powered by a witty fish. Real AI brains coming soon.
+          Powered by{' '}
+          <a href="https://huggingface.co/docs/inference-providers" target="_blank" rel="noreferrer">
+            Hugging Face Inference Providers
+          </a>
+          . No local model downloads needed!
         </small>
       </footer>
     </div>
